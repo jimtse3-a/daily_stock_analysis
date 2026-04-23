@@ -1,4 +1,4 @@
-name: 每日股票分析
+﻿name: 每日股票分析
 
 on:
   # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
@@ -92,6 +92,14 @@ jobs:
           # 数据源
           # ==========================================
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          # ==========================================
+          # LLM 渠道路由配置（通过 LLM_CHANNELS 环境变量启用多渠道 Fallback）
+          # ==========================================
+          LLM_CHANNELS: ${{ vars.LLM_CHANNELS }}
+          LLM_PRIMARY_API_KEY: ${{ secrets.LLM_PRIMARY_API_KEY }}
+          LLM_PRIMARY_BASE_URL: ${{ secrets.LLM_PRIMARY_BASE_URL }}
+          LLM_PRIMARY_MODELS: ${{ vars.LLM_PRIMARY_MODELS }}
+
           # Longbridge OpenAPI（美股/港股实时行情字段补充；不设则仅 YFinance/AkShare，无 [Longbridge] 调用）
           LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
           LONGBRIDGE_APP_SECRET: ${{ secrets.LONGBRIDGE_APP_SECRET }}
