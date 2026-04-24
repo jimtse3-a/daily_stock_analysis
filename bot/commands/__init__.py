@@ -17,6 +17,9 @@ from bot.commands.ask import AskCommand
 from bot.commands.chat import ChatCommand
 from bot.commands.research import ResearchCommand
 from bot.commands.strategies import StrategiesCommand
+from bot.commands.add_stock import AddStockCommand
+from bot.commands.remove_stock import RemoveStockCommand
+from bot.commands.list_stock import ListStockCommand
 from bot.commands.history import HistoryCommand
 
 # All available commands (for auto-registration)
@@ -31,6 +34,9 @@ ALL_COMMANDS = [
     ResearchCommand,
     StrategiesCommand,
     HistoryCommand,
+    AddStockCommand,
+    RemoveStockCommand,
+    ListStockCommand,
 ]
 
 __all__ = [
@@ -45,5 +51,8 @@ __all__ = [
     'ResearchCommand',
     'StrategiesCommand',
     'HistoryCommand',
+    'AddStockCommand',
+    'RemoveStockCommand',
+    'ListStockCommand',
     'ALL_COMMANDS',
 ]
