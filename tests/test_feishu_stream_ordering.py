@@ -15,7 +15,7 @@ class _DummyReplyClient:
         self.calls = []
         self._lock = threading.Lock()
 
-    def reply_text(self, message_id, text, at_user=False, user_id=None):
+    def reply_text(self, message_id, text, at_user=False, user_id=None, chat_id=None):
         with self._lock:
             self.calls.append(
                 {
@@ -23,9 +23,19 @@ class _DummyReplyClient:
                     "text": text,
                     "at_user": at_user,
                     "user_id": user_id,
+                    "chat_id": chat_id,
                 }
             )
         return True
+
+
+class _DummyDispatcher:
+    """Minimal dispatcher mock for unit tests."""
+    def __init__(self, on_message):
+        self._on_message = on_message
+
+    def _dispatch_sync(self, message: BotMessage) -> BotResponse:
+        return self._on_message(message)
 
 
 def _make_message(
@@ -60,7 +70,8 @@ class FeishuStreamOrderingTestCase(unittest.TestCase):
             processed.append(message.message_id)
             return BotResponse.text_response(message.message_id)
 
-        handler = FeishuStreamHandler(on_message, reply_client)
+        dispatcher = _DummyDispatcher(on_message)
+        handler = FeishuStreamHandler(dispatcher, reply_client)
         try:
             handler._enqueue_message(_make_message("m1"))
             handler._enqueue_message(_make_message("m2"))
@@ -78,7 +89,11 @@ class FeishuStreamOrderingTestCase(unittest.TestCase):
             handler.shutdown(wait=True)
 
     def test_group_chat_uses_user_scoped_ordering_key(self):
-        handler = FeishuStreamHandler(lambda _message: BotResponse.text_response("ok"), _DummyReplyClient())
+        def noop(message):
+            return BotResponse.text_response("ok")
+
+        dispatcher = _DummyDispatcher(noop)
+        handler = FeishuStreamHandler(dispatcher, _DummyReplyClient())
         try:
             key_a = handler._conversation_key(
                 _make_message("m1", user_id="u1", chat_id="group-1", chat_type=ChatType.GROUP)

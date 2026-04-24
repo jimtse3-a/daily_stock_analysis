@@ -49,9 +49,10 @@ def test_reply_text_chunked_keeps_reply_and_at_user(monkeypatch):
 
     message_id = "msg_123"
     user_id = "user_456"
+    chat_id = "chat_789"
     text = "A" * 3000  # longer than max_bytes so it will be chunked
 
-    result = client.reply_text(message_id=message_id, text=text, at_user=True, user_id=user_id)
+    result = client.reply_text(message_id=message_id, text=text, at_user=True, user_id=user_id, chat_id=chat_id)
 
     assert result is True
     # Should produce multiple chunks
@@ -59,7 +60,7 @@ def test_reply_text_chunked_keeps_reply_and_at_user(monkeypatch):
 
     for call in client.calls:
         assert call["message_id"] == message_id
-        assert call["chat_id"] is None
+        assert call["chat_id"] == chat_id
         assert call["at_user"] is True
         assert call["user_id"] == user_id
 

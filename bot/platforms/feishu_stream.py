@@ -38,6 +38,7 @@ try:
     from lark_oapi import ws
     from lark_oapi.api.im.v1 import (
         P2ImMessageReceiveV1,
+        P2ImChatAccessEventBotP2pChatEnteredV1,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         CreateMessageRequest,
@@ -122,7 +123,7 @@ class FeishuReplyClient:
             content_json = json.dumps(card_data)
 
             if message_id:
-                # 回复消息
+                # 回复消息（优先用 ReplyMessage，失败时回退到 CreateMessage 走 chat_id）
                 request = ReplyMessageRequest.builder() \
                     .message_id(message_id) \
                     .request_body(
@@ -133,6 +134,32 @@ class FeishuReplyClient:
                 ) \
                     .build()
                 response = self._client.im.v1.message.reply(request)
+
+                if not response.success():
+                    # ReplyMessage 失败时（常见原因：message_id 格式不对/消息不存在），
+                    # 回退到 CreateMessage 主动发送，确保用户能看到回复
+                    logger.warning(
+                        f"[Feishu Stream] ReplyMessage 失败(code={response.code})，"
+                        f"回退到 CreateMessage: msg_id={message_id}"
+                    )
+                    if chat_id:
+                        create_request = CreateMessageRequest.builder() \
+                            .receive_id_type(receive_id_type) \
+                            .request_body(
+                            CreateMessageRequestBody.builder()
+                            .receive_id(chat_id)
+                            .content(content_json)
+                            .msg_type("interactive")
+                            .build()
+                        ) \
+                            .build()
+                        response = self._client.im.v1.message.create(create_request)
+                    else:
+                        # 既没有有效 message_id 也没有 chat_id，无法发送
+                        logger.error(
+                            f"[Feishu Stream] 无法发送回复：message_id 无效且 chat_id 为空"
+                        )
+                        return False
             else:
                 # 主动发送消息
                 request = CreateMessageRequest.builder() \
@@ -162,7 +189,8 @@ class FeishuReplyClient:
             return False
 
     def reply_text(self, message_id: str, text: str, at_user: bool = False,
-                   user_id: Optional[str] = None) -> bool:
+                   user_id: Optional[str] = None,
+                   chat_id: Optional[str] = None) -> bool:
         """
         回复文本消息（支持交互卡片和分段发送）
 
@@ -171,6 +199,7 @@ class FeishuReplyClient:
             text: 回复文本
             at_user: 是否 @用户
             user_id: 用户 open_id（at_user=True 时需要）
+            chat_id: 会话 ID（ReplyMessage 失败时用于 CreateMessage 回退）
 
         Returns:
             是否发送成功
@@ -189,6 +218,7 @@ class FeishuReplyClient:
                 lambda chunk: self._send_interactive_card(
                     chunk,
                     message_id=message_id,
+                    chat_id=chat_id,
                     at_user=at_user,
                     user_id=user_id,
                 ),
@@ -196,7 +226,8 @@ class FeishuReplyClient:
 
         # 单条消息，使用交互卡片
         return self._send_interactive_card(
-            formatted_text, message_id=message_id, at_user=at_user, user_id=user_id
+            formatted_text, message_id=message_id, chat_id=chat_id,
+            at_user=at_user, user_id=user_id
         )
 
     def send_to_chat(self, chat_id: str, text: str,
@@ -266,15 +297,15 @@ class FeishuStreamHandler:
 
     def __init__(
             self,
-            on_message: Callable[[BotMessage], BotResponse],
+            dispatcher: 'CommandDispatcher',
             reply_client: FeishuReplyClient
     ):
         """
         Args:
-            on_message: 消息处理回调函数，接收 BotMessage 返回 BotResponse
+            dispatcher: 命令分发器
             reply_client: 飞书回复客户端
         """
-        self._on_message = on_message
+        self._dispatcher = dispatcher
         self._reply_client = reply_client
         self._logger = logger
         # Different conversations can run in parallel, but one conversation
@@ -329,22 +360,31 @@ class FeishuStreamHandler:
                     return
                 bot_message = queue.popleft()
 
-            self._process_message(bot_message)
+            # 在线程中必须调用 _dispatch_sync() 而非 dispatch() 或 dispatch_async()
+            # dispatch() 在检测到有 event loop 时会返回 coroutine（供上层 await），
+            # 但这里在 ThreadPoolExecutor 线程中没有 event loop，调用 dispatch()
+            # 会导致 asyncio.get_running_loop() 抛出 RuntimeError，回退到后台线程
+            # 路径，存在时序问题；直接调用 _dispatch_sync 永远走同步快路径。
+            try:
+                response = self._dispatcher._dispatch_sync(bot_message)
+                self._handle_response(response, bot_message)
+            except Exception as e:
+                self._logger.error(f"[Feishu Stream] 处理消息失败: {e}")
+                self._logger.exception(e)
 
-    def _process_message(self, bot_message: BotMessage) -> None:
-        """Execute command handling off the SDK callback thread."""
+    def _handle_response(self, response, bot_message: BotMessage) -> None:
+        """处理命令执行结果，发送回复"""
         try:
-            response = self._on_message(bot_message)
-
             if response and response.text:
                 self._reply_client.reply_text(
                     message_id=bot_message.message_id,
                     text=response.text,
                     at_user=response.at_user,
                     user_id=bot_message.user_id if response.at_user else None,
+                    chat_id=bot_message.chat_id,
                 )
         except Exception as e:
-            self._logger.error(f"[Feishu Stream] 异步处理消息失败: {e}")
+            self._logger.error(f"[Feishu Stream] 发送回复失败: {e}")
             self._logger.exception(e)
 
     @staticmethod
@@ -391,6 +431,50 @@ class FeishuStreamHandler:
             self._logger.error(f"[Feishu Stream] 处理消息失败: {e}")
             self._logger.exception(e)
 
+    def handle_chat_entered(self, event: 'P2ImChatAccessEventBotP2pChatEnteredV1') -> None:
+        """
+        处理用户进入单聊会话事件
+
+        当用户进入与机器人的单聊窗口时触发，可用于发送欢迎消息。
+
+        Args:
+            event: P2ImChatAccessEventBotP2pChatEnteredV1 事件对象
+        """
+        try:
+            from bot.dispatcher import get_dispatcher
+            dispatcher = get_dispatcher()
+            prefix = dispatcher.command_prefix
+
+            event_data = event.event
+            if event_data is None:
+                return
+
+            operator_id = event_data.operator_id
+            chat_id = event_data.chat_id
+
+            self._logger.info(
+                "[Feishu Stream] 用户进入单聊: open_id=%s user_id=%s chat_id=%s",
+                getattr(operator_id, 'open_id', None),
+                getattr(operator_id, 'user_id', None),
+                chat_id
+            )
+
+            welcome_text = (
+                f"你好！我是股票分析助手 🤖\n\n"
+                f"发送 `{prefix}help` 查看所有可用命令。"
+            )
+
+            if chat_id:
+                self._reply_client.send_to_chat(
+                    chat_id=chat_id,
+                    text=welcome_text,
+                    receive_id_type="chat_id"
+                )
+
+        except Exception as e:
+            self._logger.error(f"[Feishu Stream] 处理用户进入事件失败: {e}")
+            self._logger.exception(e)
+
     def _parse_event_message(self, event: 'P2ImMessageReceiveV1') -> Optional[BotMessage]:
         """
         解析飞书事件消息为统一格式
@@ -423,9 +507,10 @@ class FeishuStreamHandler:
             except json.JSONDecodeError:
                 raw_content = content_str
 
-            # 提取命令（去除 @机器人）
-            content = self._extract_command(raw_content, message_data.mentions)
-            mentioned = "@" in raw_content or bool(message_data.mentions)
+            # 提取命令（去除 @机器人），安全获取 mentions（MockMessage/dict 可能没有该属性）
+            mentions_attr = getattr(message_data, "mentions", None)
+            content = self._extract_command(raw_content, mentions_attr)
+            mentioned = "@" in raw_content or bool(mentions_attr)
 
             # 获取发送者信息
             user_id = ""
@@ -478,7 +563,7 @@ class FeishuStreamHandler:
                 content=content,
                 raw_content=raw_content,
                 mentioned=mentioned,
-                mentions=[m.key or "" for m in (message_data.mentions or [])],
+                mentions=[m.key or "" for m in (mentions_attr or [])],
                 timestamp=timestamp,
                 raw_data=raw_data,
             )
@@ -568,24 +653,16 @@ class FeishuStreamClient:
         self._background_thread: Optional[threading.Thread] = None
         self._running = False
 
-    def _create_message_handler(self) -> Callable[[BotMessage], BotResponse]:
-        """创建消息处理函数"""
-
-        def handle_message(message: BotMessage) -> BotResponse:
-            from bot.dispatcher import get_dispatcher
-            dispatcher = get_dispatcher()
-            return dispatcher.dispatch(message)
-
-        return handle_message
-
     def _create_event_handler(self) -> 'lark.EventDispatcherHandler':
         """创建事件分发处理器"""
         # 创建回复客户端
         self._reply_client = FeishuReplyClient(self._app_id, self._app_secret)
 
         # 创建消息处理器
+        from bot.dispatcher import get_dispatcher
+        dispatcher = get_dispatcher()
         handler = FeishuStreamHandler(
-            self._create_message_handler(),
+            dispatcher,
             self._reply_client
         )
         self._message_handler = handler
@@ -605,6 +682,8 @@ class FeishuStreamClient:
             level=lark.LogLevel.WARNING
         ).register_p2_im_message_receive_v1(
             handler.handle_message
+        ).register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(
+            handler.handle_chat_entered
         ).build()
 
         return event_handler
